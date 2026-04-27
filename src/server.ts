@@ -27,6 +27,87 @@ import type { Config } from "./config.js";
 
 type Logger = ReturnType<typeof import("./config.js").createLogger>;
 
+// -----------------------------------------------------------------------------
+// Output schemas (structuredContent) — compatible MCP SDK >=1.x
+//
+// Cada read-only tool devuelve `structuredContent` además del texto humano,
+// permitiendo a clientes modernos consumir tipos sin reparsing del markdown.
+// -----------------------------------------------------------------------------
+const mailboxSchema = z.object({
+  path: z.string(),
+  name: z.string(),
+  specialUse: z.string().nullable(),
+  flags: z.array(z.string()),
+  delimiter: z.string().nullable().optional(),
+  subscribed: z.boolean().optional(),
+});
+
+const folderListSchema = { folders: z.array(mailboxSchema) };
+
+const mailboxStatusSchema = {
+  mailbox: z.string(),
+  messages: z.number().int(),
+  unseen: z.number().int(),
+  recent: z.number().int(),
+  uidNext: z.number().int().optional(),
+};
+
+const emailHeaderSchema = z.object({
+  uid: z.number().int(),
+  from: z.string().optional(),
+  to: z.array(z.string()).optional(),
+  subject: z.string().optional(),
+  date: z.string().optional(),
+  flags: z.array(z.string()),
+  size: z.number().int().optional(),
+});
+
+const emailListSchema = {
+  mailbox: z.string(),
+  total: z.number().int(),
+  count: z.number().int(),
+  offset: z.number().int(),
+  has_more: z.boolean(),
+  next_offset: z.number().int().optional(),
+  items: z.array(emailHeaderSchema),
+};
+
+const emailSearchSchema = {
+  mailbox: z.string(),
+  matched: z.number().int(),
+  count: z.number().int(),
+  has_more: z.boolean(),
+  items: z.array(emailHeaderSchema),
+};
+
+const emailFullSchema = {
+  uid: z.number().int(),
+  from: z.string().optional(),
+  to: z.array(z.string()),
+  cc: z.array(z.string()),
+  subject: z.string().optional(),
+  date: z.string().optional(),
+  flags: z.array(z.string()),
+  textBody: z.string().optional(),
+  htmlBody: z.string().optional(),
+  attachments: z.array(
+    z.object({
+      filename: z.string().optional(),
+      contentType: z.string(),
+      size: z.number().int(),
+    }),
+  ),
+};
+
+const attachmentSchema = {
+  filename: z.string().optional(),
+  contentType: z.string(),
+  size_bytes: z.number().int(),
+  returned_bytes: z.number().int(),
+  truncated: z.boolean(),
+  base64: z.string(),
+};
+
 export function buildServer(cfg: Config, log: Logger): { server: McpServer; imap: ImapClient; smtp: SmtpClient } {
   const imap = new ImapClient(cfg.bridge, log);
   const smtp = new SmtpClient(cfg.bridge, log);
@@ -51,19 +132,21 @@ export function buildServer(cfg: Config, log: Logger): { server: McpServer; imap
       inputSchema: {
         response_format: z.enum(["markdown", "json"]).default("markdown").describe("Output format"),
       },
+      outputSchema: folderListSchema,
       annotations: { readOnlyHint: true, openWorldHint: true, idempotentHint: true },
     },
     async ({ response_format }) => {
       const mbs = await imap.listMailboxes();
+      const structured = { folders: mbs };
       if (response_format === "json") {
-        return { content: [{ type: "text", text: JSON.stringify(mbs, null, 2) }] };
+        return { content: [{ type: "text", text: JSON.stringify(mbs, null, 2) }], structuredContent: structured };
       }
       const lines = [
         "| Path | Name | Special-use | Flags |",
         "|---|---|---|---|",
         ...mbs.map((m) => `| \`${m.path}\` | ${m.name} | ${m.specialUse ?? "—"} | ${m.flags.join(", ") || "—"} |`),
       ];
-      return { content: [{ type: "text", text: lines.join("\n") }] };
+      return { content: [{ type: "text", text: lines.join("\n") }], structuredContent: structured };
     },
   );
 
@@ -87,6 +170,7 @@ export function buildServer(cfg: Config, log: Logger): { server: McpServer; imap
       title: "Get mailbox counts",
       description: "Returns total messages, unseen/unread count and recent count for a mailbox. Fast — useful for Routines to check 'do I have unread mail?'.",
       inputSchema: { mailbox: z.string().default("INBOX").describe("Mailbox path, e.g. INBOX") },
+      outputSchema: mailboxStatusSchema,
       annotations: { readOnlyHint: true, openWorldHint: true, idempotentHint: true },
     },
     async ({ mailbox }) => {
@@ -98,6 +182,7 @@ export function buildServer(cfg: Config, log: Logger): { server: McpServer; imap
             text: `**${mailbox}** — total: ${s.messages}, unseen: ${s.unseen}, recent: ${s.recent}${s.uidNext ? `, uidNext: ${s.uidNext}` : ""}`,
           },
         ],
+        structuredContent: { mailbox, messages: s.messages, unseen: s.unseen, recent: s.recent, ...(s.uidNext ? { uidNext: s.uidNext } : {}) },
       };
     },
   );
@@ -117,25 +202,24 @@ export function buildServer(cfg: Config, log: Logger): { server: McpServer; imap
         offset: z.number().int().min(0).default(0),
         response_format: z.enum(["markdown", "json"]).default("markdown"),
       },
+      outputSchema: emailListSchema,
       annotations: { readOnlyHint: true, openWorldHint: true, idempotentHint: true },
     },
     async ({ mailbox, limit, offset, response_format }) => {
       const { items, total } = await imap.listEmails(mailbox, limit, offset);
+      const structured = {
+        mailbox,
+        total,
+        count: items.length,
+        offset,
+        has_more: offset + items.length < total,
+        next_offset: offset + items.length,
+        items,
+      };
       if (response_format === "json") {
-        return {
-          content: [
-            {
-              type: "text",
-              text: JSON.stringify(
-                { mailbox, total, count: items.length, offset, has_more: offset + items.length < total, next_offset: offset + items.length, items },
-                null,
-                2,
-              ),
-            },
-          ],
-        };
+        return { content: [{ type: "text", text: JSON.stringify(structured, null, 2) }], structuredContent: structured };
       }
-      return { content: [{ type: "text", text: renderEmailList(items, mailbox, total, offset) }] };
+      return { content: [{ type: "text", text: renderEmailList(items, mailbox, total, offset) }], structuredContent: structured };
     },
   );
 
@@ -160,6 +244,7 @@ export function buildServer(cfg: Config, log: Logger): { server: McpServer; imap
         limit: z.number().int().min(1).max(100).default(25),
         response_format: z.enum(["markdown", "json"]).default("markdown"),
       },
+      outputSchema: emailSearchSchema,
       annotations: { readOnlyHint: true, openWorldHint: true, idempotentHint: true },
     },
     async (args) => {
@@ -185,24 +270,18 @@ export function buildServer(cfg: Config, log: Logger): { server: McpServer; imap
         }
       }
       const { items, matched } = await imap.searchEmails(args.mailbox, criteria, args.limit);
+      const structured = { mailbox: args.mailbox, matched, count: items.length, has_more: matched > items.length, items };
       if (args.response_format === "json") {
         return {
-          content: [
-            {
-              type: "text",
-              text: JSON.stringify(
-                { mailbox: args.mailbox, matched, count: items.length, has_more: matched > items.length, items },
-                null,
-                2,
-              ),
-            },
-          ],
+          content: [{ type: "text", text: JSON.stringify(structured, null, 2) }],
+          structuredContent: structured,
         };
       }
       return {
         content: [
           { type: "text", text: `Matched ${matched} message(s), showing ${items.length}.\n\n${renderEmailList(items, args.mailbox, matched, 0)}` },
         ],
+        structuredContent: structured,
       };
     },
   );
@@ -215,27 +294,24 @@ export function buildServer(cfg: Config, log: Logger): { server: McpServer; imap
     {
       title: "Read one email (full body)",
       description:
-        "Fetches one email by UID, with headers, text/html body and attachment metadata. Use proton_get_attachment to download attachment bytes. Large HTML bodies are returned as-is — truncate client-side if needed.",
+        "Fetches one email by UID, with headers, text/html body and attachment metadata. Use proton_get_attachment to download attachment bytes. Large HTML bodies are returned as-is — truncate client-side if needed. To mark as read, call proton_flag_email separately (keeps this tool purely read-only).",
       inputSchema: {
         mailbox: z.string().default("INBOX"),
         uid: z.number().int().positive().describe("Message UID (from list/search)"),
         include_html: z.boolean().default(false).describe("Include HTML body in addition to text"),
-        mark_as_read: z.boolean().default(false).describe("Mark the message as seen after fetching"),
         response_format: z.enum(["markdown", "json"]).default("markdown"),
       },
-      annotations: { readOnlyHint: false, openWorldHint: true, idempotentHint: false },
+      outputSchema: emailFullSchema,
+      annotations: { readOnlyHint: true, openWorldHint: true, idempotentHint: true },
     },
-    async ({ mailbox, uid, include_html, mark_as_read, response_format }) => {
+    async ({ mailbox, uid, include_html, response_format }) => {
       const msg = await imap.getEmail(mailbox, uid);
       if (!msg) {
         return { isError: true, content: [{ type: "text", text: `No message with UID ${uid} in ${mailbox}.` }] };
       }
-      if (mark_as_read) await imap.setFlags(mailbox, uid, ["\\Seen"], []);
       const out = include_html ? msg : { ...msg, htmlBody: undefined };
-      if (response_format === "json") {
-        return { content: [{ type: "text", text: JSON.stringify(out, null, 2) }] };
-      }
-      return { content: [{ type: "text", text: renderFullEmail(out) }] };
+      const text = response_format === "json" ? JSON.stringify(out, null, 2) : renderFullEmail(out);
+      return { content: [{ type: "text", text }], structuredContent: out as unknown as Record<string, unknown> };
     },
   );
 
@@ -256,6 +332,7 @@ export function buildServer(cfg: Config, log: Logger): { server: McpServer; imap
           .default(10 * 1024 * 1024)
           .describe("Maximum attachment size in bytes (default 10 MB, hard cap 50 MB)"),
       },
+      outputSchema: attachmentSchema,
       annotations: { readOnlyHint: true, openWorldHint: true, idempotentHint: true },
     },
     async ({ mailbox, uid, index, max_bytes }) => {
@@ -270,20 +347,17 @@ export function buildServer(cfg: Config, log: Logger): { server: McpServer; imap
       const bytes = Buffer.from(att.base64, "base64");
       const truncated = bytes.byteLength > max_bytes;
       const payload = truncated ? bytes.subarray(0, max_bytes) : bytes;
+      const structured = {
+        filename: att.filename,
+        contentType: att.contentType,
+        size_bytes: bytes.byteLength,
+        returned_bytes: payload.byteLength,
+        truncated,
+        base64: payload.toString("base64"),
+      };
       return {
-        content: [
-          {
-            type: "text",
-            text: JSON.stringify({
-              filename: att.filename,
-              contentType: att.contentType,
-              size_bytes: bytes.byteLength,
-              returned_bytes: payload.byteLength,
-              truncated,
-              base64: payload.toString("base64"),
-            }),
-          },
-        ],
+        content: [{ type: "text", text: JSON.stringify(structured) }],
+        structuredContent: structured,
       };
     },
   );
